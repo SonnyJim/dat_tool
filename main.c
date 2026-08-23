@@ -3,8 +3,15 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mtio.h>
+
+#if defined(__sgi) || defined(sgi)
+#include <sys/dsreq.h>
+#endif
+
 #include "dat_tool.h"
 
 // Known compatible drives: vendor + product ID prefix (XXX = variant suffix, any value)
@@ -79,29 +86,39 @@ static void rtrim(char *s) {
         s[--len] = '\0';
 }
 
-static int read_sysfs_attr(const char *devname, const char *attr, char *out, int out_len) {
-    char path[256];
-    snprintf(path, sizeof(path), "/sys/class/scsi_tape/%s/device/%s", devname, attr);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    int ok = (fgets(out, out_len, f) != NULL);
-    fclose(f);
-    if (ok) rtrim(out);
-    return ok;
-}
-
 static void print_drive_info(const char *dev_path) {
     char vendor[16] = {0}, model[32] = {0}, rev[8] = {0};
+    int have_info = 0;
 
-    const char *devname = strrchr(dev_path, '/');
-    devname = devname ? devname + 1 : dev_path;
+#if defined(__sgi) || defined(sgi)
+    int ds_fd = open(dev_path, O_RDONLY | O_NDELAY);
+    if (ds_fd >= 0) {
+        struct dsreq ds;
+        char inq_buf[36];
+        char cdb[6] = {0x12, 0, 0, 0, 36, 0}; // SCSI Inquiry Command
 
-    int have_vendor = read_sysfs_attr(devname, "vendor", vendor, sizeof(vendor));
-    int have_model  = read_sysfs_attr(devname, "model",  model,  sizeof(model));
-    int have_rev    = read_sysfs_attr(devname, "rev",    rev,    sizeof(rev));
+        memset(&ds, 0, sizeof(ds));
+        ds.ds_cmdbuf = cdb;
+        ds.ds_cmdlen = 6;
+        ds.ds_databuf = inq_buf;
+        ds.ds_datalen = 36;
+        ds.ds_flags = DSRQ_READ;
 
-    if (!have_vendor && !have_model) {
-        printf("Drive info : unavailable (sysfs not accessible)\n");
+        if (ioctl(ds_fd, DS_ENTER, &ds) == 0 && ds.ds_status == 0) {
+            memcpy(vendor, inq_buf + 8, 8);
+            memcpy(model,  inq_buf + 16, 16);
+            memcpy(rev,    inq_buf + 32, 4);
+            rtrim(vendor);
+            rtrim(model);
+            rtrim(rev);
+            have_info = 1;
+        }
+        close(ds_fd);
+    }
+#endif
+
+    if (!have_info) {
+        printf("Drive info : %s (IRIX target)\n", dev_path);
         return;
     }
 
@@ -116,7 +133,7 @@ static void print_drive_info(const char *dev_path) {
     }
 
     int fw_ok = 0;
-    if (have_rev) {
+    if (rev[0] != '\0') {
         for (int i = 0; i < (int)NUM_KNOWN_FIRMWARES; i++) {
             if (strcmp(vendor, known_firmwares[i].vendor) == 0 &&
                 strncmp(model, known_firmwares[i].product_prefix,
@@ -132,14 +149,29 @@ static void print_drive_info(const char *dev_path) {
            vendor, model,
            drive_ok ? "COMPATIBLE" : "UNKNOWN");
     printf("Firmware  : %s  [%s]\n",
-           have_rev ? rev : "?",
+           rev[0] ? rev : "?",
            fw_ok ? "COMPATIBLE" : "UNKNOWN");
 }
 
 void configure_tape_drive(int fd) {
     struct mtop mt_cmd;
 
-    printf("Initializing tape drive (MTLOAD)...\n");
+    printf("Initializing tape drive...\n");
+
+#if defined(__sgi) || defined(sgi)
+    // On IRIX, MTRET (retension/load) is the closest operation to MTLOAD
+#ifdef MTRET
+    //mt_cmd.mt_op = MTRET;
+    //mt_cmd.mt_count = 1;
+    //ioctl(fd, MTIOCTOP, &mt_cmd);
+#endif
+    sleep(2);
+
+    printf("Configuring tape drive parameters...\n");
+    printf(" [+] Using IRIX tape drive descriptor.\n");
+    printf("     Note: Use an uncompressed, variable-block IRIX tape device path\n");
+    printf("     (e.g., /dev/rmt/t8d3nr) for DAT audio operations.\n");
+#else
     mt_cmd.mt_op = MTLOAD;
     mt_cmd.mt_count = 1;
     ioctl(fd, MTIOCTOP, &mt_cmd);
@@ -161,8 +193,7 @@ void configure_tape_drive(int fd) {
         printf(" [+] Density set to 0x80 (Audio)\n");
     } else {
         perror(" [-] Failed to set density");
-        fprintf(stderr, "[ERROR] Drive may not have audio firmware. Audio operations require\n"
-                        "        a DAT drive with audio firmware (e.g. ARCHIVE Python, SONY SDT-9000).\n");
+        fprintf(stderr, "[ERROR] Drive may not have audio firmware.\n");
         close(fd); exit(1);
     }
 
@@ -173,9 +204,11 @@ void configure_tape_drive(int fd) {
         perror(" [-] Failed to disable compression");
         close(fd); exit(1);
     }
+#endif
 
     printf("----------------------------------------\n");
 }
+
 
 // --- Argument parsing ---
 
@@ -196,16 +229,16 @@ static size_t parse_buffer_size(const char *s) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s play  [params] /dev/st0\n", prog);
-    fprintf(stderr, "  %s save  [params] /dev/st0 [prefix]    (default prefix 'track')\n", prog);
-    fprintf(stderr, "  %s write [params] /dev/st0 tape.cue\n", prog);
+    fprintf(stderr, "  %s play  [params] /dev/tape\n", prog);
+    fprintf(stderr, "  %s save  [params] /dev/tape [prefix]    (default prefix 'track')\n", prog);
+    fprintf(stderr, "  %s write [params] /dev/tape tape.cue\n", prog);
     fprintf(stderr, "\nParameters (name=value, any order, before device path):\n");
     fprintf(stderr, "  dat_batch=N   frames per write() syscall  (write only; 1..%d, default 1)\n", MAX_BATCH);
     fprintf(stderr, "  buffer=SIZE   RAM ring buffer size        (e.g. 4M, 64M, 1G; default 4M)\n");
     fprintf(stderr, "\nExamples:\n");
-    fprintf(stderr, "  %s save  dat_batch=2 /dev/st0 mytape\n", prog);
-    fprintf(stderr, "  %s play  dat_batch=2 buffer=64M /dev/st0\n", prog);
-    fprintf(stderr, "  %s write dat_batch=2 /dev/st0 tape.cue\n", prog);
+    fprintf(stderr, "  %s save  dat_batch=2 /dev/tape mytape\n", prog);
+    fprintf(stderr, "  %s play  dat_batch=2 buffer=64M /dev/tape\n", prog);
+    fprintf(stderr, "  %s write dat_batch=2 /dev/tape tape.cue\n", prog);
 }
 
 // Parse named params (name=value) from argv[start..argc), stopping at first

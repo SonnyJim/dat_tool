@@ -1,7 +1,14 @@
+#define _SGI_SOURCE
+#define _XOPEN_SOURCE 600
+#define _POSIX_C_SOURCE 200112L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <time.h>
 #include <pthread.h>
 #include <termios.h>
 #include <errno.h>
@@ -153,7 +160,14 @@ static void *tape_reader_thread(void *arg) {
 // Returns 1=frame ready, 0=EOF, -1=timeout
 static int ring_get_timed(ReadRing *r, unsigned char *frame, int ms) {
     struct timespec ts;
+    #if defined(__sgi) || defined(sgi) || !defined(CLOCK_REALTIME)
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    ts.tv_sec = tv.tv_sec;
+    ts.tv_nsec = tv.tv_usec * 1000;
+#else
     clock_gettime(CLOCK_REALTIME, &ts);
+#endif
     ts.tv_nsec += (long)ms * 1000000L;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
 

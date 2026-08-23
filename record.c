@@ -7,6 +7,19 @@
 #include <sys/mtio.h>
 #include "dat_tool.h"
 
+#include <stdint.h>
+
+static uint16_t swap16(uint16_t v) {
+    return (uint16_t)((v >> 8) | (v << 8));
+}
+
+static uint32_t swap32(uint32_t v) {
+    return ((v >> 24) & 0x000000FF) |
+           ((v >> 8)  & 0x0000FF00) |
+           ((v << 8)  & 0x00FF0000) |
+           ((v << 24) & 0xFF000000);
+}
+
 int g_abs_frames = 0; // Absolute frame counter
 int g_rel_frames = 0; // Relative frame counter
 
@@ -59,6 +72,7 @@ static void *tape_writer_thread(void *arg) {
 
         size_t bytes = take * FRAME_SIZE;
         if ((size_t)write(r->fd, buf, bytes) != bytes) {
+		perror("[TAPE WRITE ERROR]");
             pthread_mutex_lock(&r->lock);
             r->err = 1;
             pthread_cond_broadcast(&r->space);
@@ -207,7 +221,12 @@ void validate_and_print_playlist(const CueConfig *cfg) {
             fprintf(stderr, "\n[FATAL ERROR] File [%02d] '%s' is not a valid WAV file.\n", i + 1, cfg->files[i]);
             exit(1);
         }
-
+#if defined(__sgi) || defined(sgi)
+        hdr.format_type     = swap16(hdr.format_type);
+        hdr.channels        = swap16(hdr.channels);
+        hdr.sample_rate     = swap32(hdr.sample_rate);
+        hdr.bits_per_sample = swap16(hdr.bits_per_sample);
+#endif
         // Strict format validation
         if (hdr.format_type != 1) {
             fprintf(stderr, "\n[FATAL ERROR] '%s' is compressed. Only uncompressed PCM WAV is supported.\n", cfg->files[i]);
@@ -301,21 +320,27 @@ void write_pack(unsigned char *pack, int item, int pno, int h, int m, int s, int
 }
 
 void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno, int start_id, int lp_mode) {
-    unsigned char frame[FRAME_SIZE];
+    static unsigned char frame[FRAME_SIZE];
     memset(frame, 0, FRAME_SIZE);
 
+    // 1. Copy PCM audio payload into the front of the frame buffer
+    int payload_size;
     if (lp_mode) {
+        payload_size = LP_INPUT_SIZE;
         encode_lp_frame(audio_data, frame);
     } else {
-        int payload_size = (sample_rate == 48000) ? 5760 : (sample_rate == 44100 ? 5292 : 3840);
+        payload_size = (sample_rate == 48000) ? 5760 : (sample_rate == 44100 ? 5292 : 3840);
         memcpy(frame, audio_data, payload_size);
     }
 
-    unsigned char *scode = frame + DATA_SIZE;
-    unsigned char *packs = scode;
-    unsigned char *subid = scode + 56;
-    unsigned char *mainid = subid + 4;
+    // 2. Anchor subcode pointers to absolute frame offsets to prevent stack corruption
+    // DATA_SIZE (5760) + subcode allocations fit cleanly inside FRAME_SIZE (5822)
+    unsigned char *scode  = frame + 5760;
+    unsigned char *packs  = scode;          // 48 bytes reserved for 6 pack structures (6 x 8)
+    unsigned char *subid  = scode + 48;     // 4 bytes reserved for Sub-ID header
+    unsigned char *mainid = subid + 4;      // 4 bytes reserved for Main-ID header
 
+    // 3. Convert frame counters to DAT timecode
     int a_h, a_m, a_s, a_f;
     int r_h, r_m, r_s, r_f;
     if (lp_mode) {
@@ -326,6 +351,7 @@ void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno
         frames_to_time(g_rel_frames, &r_h, &r_m, &r_s, &r_f);
     }
 
+    // 4. Populate 6 subcode packs with relative and absolute timecode
     write_pack(&packs[0],  1, pno, r_h, r_m, r_s, r_f);
     write_pack(&packs[8],  2, pno, a_h, a_m, a_s, a_f);
     write_pack(&packs[16], 1, pno, r_h, r_m, r_s, r_f);
@@ -333,37 +359,46 @@ void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno
     write_pack(&packs[32], 1, pno, r_h, r_m, r_s, r_f);
     write_pack(&packs[40], 2, pno, a_h, a_m, a_s, a_f);
 
-    // --- Sub-ID Setup ---
+    // 5. Populate Sub-ID bytes
     subid[0] = (pno > 0) ? 0x80 : 0x00;
-    if (start_id) subid[0] |= 0x40;
+    if (start_id) {
+        subid[0] |= 0x40; // Set Start-ID flag
+    }
 
     if (pno > 0) {
         subid[1] = 0x01;
-        subid[2] = (((pno / 10) % 10) << 4) | (pno % 10);
+        subid[2] = (unsigned char)((((pno / 10) % 10) << 4) | (pno % 10)); // Program number in BCD
     } else {
-        subid[1] = 0x00; subid[2] = 0x00;
+        subid[1] = 0x00;
+        subid[2] = 0x00;
     }
-    subid[3] = subid[0] ^ subid[1] ^ subid[2];
+    // Calculate 4th byte parity checksum
+    subid[3] = (unsigned char)(subid[0] ^ subid[1] ^ subid[2]);
 
-    // --- Main-ID Setup ---
+    // 6. Populate Main-ID bytes (Sampling rate & mode flags)
     int sr_bits = 0;
-    if (sample_rate == 44100) sr_bits = 1;
+    if (sample_rate == 44100)      sr_bits = 1;
     else if (sample_rate == 32000) sr_bits = 2;
-    mainid[0] = (unsigned char)((sr_bits << 2) | 0x00);
-    mainid[1] = lp_mode ? 0x40 : 0x00;  // bit 6 = encoding: 0=16-bit SP, 1=12-bit LP
 
+    mainid[0] = (unsigned char)((sr_bits << 2) & 0x0C);
+    mainid[1] = lp_mode ? 0x40 : 0x00;
+    mainid[2] = 0x00;
+    mainid[3] = (unsigned char)(mainid[0] ^ mainid[1] ^ mainid[2]);
+
+    // 7. Write complete frame to ring buffer or tape descriptor
     if (g_write_ring) {
         if (ring_put(g_write_ring, frame) < 0) {
-            fprintf(stderr, "\n\n[FATAL ERROR] Tape drive rejected the write command\n");
+            fprintf(stderr, "\n[FATAL ERROR] Ring buffer rejected write operation\n");
             exit(1);
         }
     } else {
         if (write(fd, frame, FRAME_SIZE) != FRAME_SIZE) {
-            perror("\n\n[FATAL ERROR] Tape drive rejected the write command");
+            perror("\n[FATAL ERROR] Tape drive write failed");
             exit(1);
         }
     }
 
+    // 8. Increment frame metrics
     g_abs_frames++;
     g_rel_frames++;
 }
@@ -392,20 +427,34 @@ void write_silence(int fd, int seconds, int sample_rate, const char *zone, int l
     }
     printf("\r[SILENCE] Completed.             \n");
 }
-
 void write_wav_file(int fd, const char *filepath, int pno, CueConfig *cfg) {
+    fprintf(stderr, "[DEBUG] Entering write_wav_file for: %s (Track %d)\n", filepath, pno);
+    fflush(stderr);
+
     FILE *wav = fopen(filepath, "rb");
-    if (!wav) { fprintf(stderr, " [-] Cannot open %s\n", filepath); return; }
+    if (!wav) { 
+        fprintf(stderr, " [-] Cannot open %s\n", filepath); 
+        return; 
+    }
 
     WavHeader hdr;
-    fread(&hdr, sizeof(WavHeader), 1, wav);
+    if (fread(&hdr, sizeof(WavHeader), 1, wav) != 1) {
+        fprintf(stderr, " [ERROR] Failed to read WAV header\n");
+        fclose(wav);
+        return;
+    }
+
+    // Safely parse little-endian header integers for MIPS/IRIX
+    unsigned char *hdr_bytes = (unsigned char *)&hdr;
+    int sample_rate = hdr_bytes[24] | (hdr_bytes[25] << 8) | (hdr_bytes[26] << 16) | (hdr_bytes[27] << 24);
+    int channels    = hdr_bytes[22] | (hdr_bytes[23] << 8);
+
+    fprintf(stderr, "[DEBUG] WAV Header parsed: sample_rate=%d, channels=%d\n", sample_rate, channels);
+    fflush(stderr);
+
     fseek(wav, 44, SEEK_SET);
 
-    int sample_rate = hdr.sample_rate;
-    int channels = hdr.channels;
     int lp_mode = cfg->lp_mode;
-
-    // LP mode consumes 7680 bytes of PCM per frame (1920 stereo pairs at 32kHz)
     int read_size;
     if (lp_mode) {
         read_size = LP_INPUT_SIZE;
@@ -413,18 +462,53 @@ void write_wav_file(int fd, const char *filepath, int pno, CueConfig *cfg) {
         read_size = (sample_rate == 48000) ? 5760 : (sample_rate == 44100 ? 5292 : 3840);
     }
 
+    fprintf(stderr, "[DEBUG] Target payload read_size per frame = %d bytes\n", read_size);
+    fflush(stderr);
+
     unsigned char buf[LP_INPUT_SIZE];
     int bytes_read;
     int start_id_written = 0;
     uint32_t current_audio_bytes = 0;
     int last_printed_second = -1;
-    int max_start_id_frames = lp_mode ? 150 : 300;  // ~9 sec worth at respective frame rates
+    int max_start_id_frames = lp_mode ? 150 : 300;
     g_rel_frames = 0;
 
+    int frame_counter = 0;
+    fprintf(stderr, "[DEBUG] Entering main WAV read loop...\n");
+    fflush(stderr);
+
     while ((bytes_read = fread(buf, 1, read_size, wav)) > 0) {
-        if (bytes_read < read_size) memset(buf + bytes_read, 0, read_size - bytes_read);
+        frame_counter++;
+
+        if (bytes_read < read_size) {
+            fprintf(stderr, "[DEBUG] Partial frame read (%d / %d bytes). Zero-padding rest.\n", bytes_read, read_size);
+            fflush(stderr);
+            memset(buf + bytes_read, 0, read_size - bytes_read);
+        }
+
+        // =========================================================================
+        // SAFE ENDIAN SWAP FOR MIPS (Little-Endian WAV -> Big-Endian DAT)
+        // =========================================================================
+#if defined(__sgi) || defined(sgi)
+        if (frame_counter == 1) {
+            fprintf(stderr, "[DEBUG] Swapping PCM endianness for MIPS architecture...\n");
+            fflush(stderr);
+        }
+        for (int k = 0; k < read_size - 1; k += 2) {
+            unsigned char tmp = buf[k];
+            buf[k]     = buf[k + 1];
+            buf[k + 1] = tmp;
+        }
+#endif
+        // =========================================================================
 
         int do_start_id = (cfg->startid && start_id_written < max_start_id_frames) ? 1 : 0;
+
+        if (frame_counter == 1) {
+            fprintf(stderr, "[DEBUG] Invoking write_dat_frame for frame #1...\n");
+            fflush(stderr);
+        }
+
         write_dat_frame(fd, buf, sample_rate, cfg->program_number ? pno : 0, do_start_id, lp_mode);
         start_id_written++;
 
@@ -435,12 +519,15 @@ void write_wav_file(int fd, const char *filepath, int pno, CueConfig *cfg) {
             int h = total_seconds / 3600;
             int m = (total_seconds % 3600) / 60;
             int s = total_seconds % 60;
-            printf("\r[WRITING] Track %02d | Time: %02d:%02d:%02d", pno, h, m, s);
-            fflush(stdout);
+            fprintf(stderr, "\r[WRITING] Track %02d | Time: %02d:%02d:%02d", pno, h, m, s);
+            fflush(stderr);
             last_printed_second = total_seconds;
         }
     }
-    printf("\n");
+
+    fprintf(stderr, "\n[DEBUG] Exited WAV loop successfully. Total frames processed: %d\n", frame_counter);
+    fflush(stderr);
+
     fclose(wav);
 }
 
@@ -484,15 +571,23 @@ int execute_record(int fd, const char *cue_file, size_t buffer_size, int dat_bat
     pthread_mutex_init(&ring.lock, NULL);
     pthread_cond_init(&ring.avail, NULL);
     pthread_cond_init(&ring.space, NULL);
-    pthread_create(&ring.thread, NULL, tape_writer_thread, &ring);
+    pthread_attr_t attr;
+pthread_attr_init(&attr);
+pthread_attr_setstacksize(&attr, 2 * 1024 * 1024); // 2 MB Stack Size
+
+pthread_create(&ring.thread, &attr, tape_writer_thread, &ring);
+pthread_attr_destroy(&attr);
+
+    //pthread_create(&ring.thread, NULL, tape_writer_thread, &ring);
     g_write_ring = &ring;
 
-    size_t buf_mb = (cap_frames * FRAME_SIZE) / (1024 * 1024);
-    printf("Buffer      : %zu MB (%zu frames)\n", buf_mb, cap_frames);
-    if (ring.batch > 1)
-        printf("Batch mode  : %d frames per SCSI WRITE (%d bytes/block) -- experimental\n",
-               ring.batch, ring.batch * FRAME_SIZE);
-
+	size_t buf_mb = (cap_frames * FRAME_SIZE) / (1024 * 1024);
+//	printf("Buffer      : %zu MB (%zu frames)\n", buf_mb, cap_frames);
+	if (ring.batch > 1) {
+//	    printf("Batch mode  : %d frames per SCSI WRITE (%d bytes/block) -- experimental\n",
+//		   ring.batch, ring.batch * FRAME_SIZE);
+	}
+	fflush(stdout); // <--- Add this! Force output to terminal immediately.
     g_abs_frames = 0;
 
     int sr_silence = cfg.lp_mode ? 32000 : 44100;

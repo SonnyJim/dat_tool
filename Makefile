@@ -1,6 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -O2
+CFLAGS = -Wall -O2 -std=c99 -g
 LDFLAGS = -lpthread
+
 TARGET = dat_tool
 OBJS = main.o extract.o record.o
 
