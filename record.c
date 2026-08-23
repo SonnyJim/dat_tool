@@ -72,7 +72,7 @@ static void *tape_writer_thread(void *arg) {
 
         size_t bytes = take * FRAME_SIZE;
         if ((size_t)write(r->fd, buf, bytes) != bytes) {
-		perror("[TAPE WRITE ERROR]");
+            perror("[TAPE WRITE ERROR]");
             pthread_mutex_lock(&r->lock);
             r->err = 1;
             pthread_cond_broadcast(&r->space);
@@ -427,6 +427,7 @@ void write_silence(int fd, int seconds, int sample_rate, const char *zone, int l
     }
     printf("\r[SILENCE] Completed.             \n");
 }
+
 void write_wav_file(int fd, const char *filepath, int pno, CueConfig *cfg) {
     fprintf(stderr, "[DEBUG] Entering write_wav_file for: %s (Track %d)\n", filepath, pno);
     fflush(stderr);
@@ -540,8 +541,28 @@ int execute_record(int fd, const char *cue_file, size_t buffer_size, int dat_bat
 
     validate_and_print_playlist(&cfg);
 
-    printf("Rewinding tape to the beginning... Please wait.\n");
     struct mtop mt_cmd;
+
+    // 1. Enable raw DAT Audio Mode via IRIX MTAUD ioctl
+    mt_cmd.mt_op = MTAUD;
+    mt_cmd.mt_count = 1;
+    if (ioctl(fd, MTIOCTOP, &mt_cmd) < 0) {
+        perror(" [-] Warning: Failed to set MTAUD mode via ioctl");
+    } else {
+        printf(" [+] IRIX Tape Subsystem switched to AUDIO mode (MTAUD)\n");
+    }
+
+    // 2. Configure SCSI write-buffering if supported
+#if defined(MTSETDRVBUFFER)
+    mt_cmd.mt_op = MTSETDRVBUFFER;
+    mt_cmd.mt_count = 1;
+    if (ioctl(fd, MTIOCTOP, &mt_cmd) < 0) {
+        perror(" [-] Warning: Could not configure SCSI drive write buffer");
+    }
+#endif
+
+    // 3. Rewind Tape
+    printf("Rewinding tape to the beginning... Please wait.\n");
     mt_cmd.mt_op = MTREW;
     mt_cmd.mt_count = 1;
     if (ioctl(fd, MTIOCTOP, &mt_cmd) < 0) {
@@ -572,22 +593,15 @@ int execute_record(int fd, const char *cue_file, size_t buffer_size, int dat_bat
     pthread_cond_init(&ring.avail, NULL);
     pthread_cond_init(&ring.space, NULL);
     pthread_attr_t attr;
-pthread_attr_init(&attr);
-pthread_attr_setstacksize(&attr, 2 * 1024 * 1024); // 2 MB Stack Size
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 2 * 1024 * 1024); // 2 MB Stack Size
 
-pthread_create(&ring.thread, &attr, tape_writer_thread, &ring);
-pthread_attr_destroy(&attr);
+    pthread_create(&ring.thread, &attr, tape_writer_thread, &ring);
+    pthread_attr_destroy(&attr);
 
-    //pthread_create(&ring.thread, NULL, tape_writer_thread, &ring);
     g_write_ring = &ring;
 
-	size_t buf_mb = (cap_frames * FRAME_SIZE) / (1024 * 1024);
-//	printf("Buffer      : %zu MB (%zu frames)\n", buf_mb, cap_frames);
-	if (ring.batch > 1) {
-//	    printf("Batch mode  : %d frames per SCSI WRITE (%d bytes/block) -- experimental\n",
-//		   ring.batch, ring.batch * FRAME_SIZE);
-	}
-	fflush(stdout); // <--- Add this! Force output to terminal immediately.
+    fflush(stdout); // <--- Force output to terminal immediately.
     g_abs_frames = 0;
 
     int sr_silence = cfg.lp_mode ? 32000 : 44100;
