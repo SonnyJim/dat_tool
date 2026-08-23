@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define FRAME_SIZE    5822
+#define FRAME_SIZE    5824
 #define DATA_SIZE     5760
 #define LP_INPUT_SIZE 7680  // bytes of 16-bit PCM consumed per LP frame (1920 stereo pairs)
 #define MAX_BATCH     32
